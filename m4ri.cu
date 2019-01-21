@@ -287,7 +287,7 @@ uint32_t * allocate_matrix_host(int rows,int cols) {
 
 // a =cb и таков порядок аргубемнов
 int wrapper_m4ri(uint32_t *a,uint32_t *c,uint32_t *b,int rows,int cols){
-int table_cols_max = 32;
+int table_cols_max = cols;
 int num_tables = rows/K;
 int num_launches = cols/table_cols_max;
 int table_cols_n = table_cols_max;
