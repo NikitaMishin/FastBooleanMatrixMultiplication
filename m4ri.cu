@@ -89,43 +89,43 @@ __device__ int snoob(int i)
 __global__ void make_table(uint32_t *B, uint32_t ** lookup_tables, int cols, int rows, int tables_num, int real_cols, int offset) {
 
 //каждый элемент считает часть таблицу (256 элементов)   8 элементов в матр-це б
-int x_col = blockIdx.x * BLOCK_SIZE + threadIdx.x; // позиция в колонке этого потока
-int y_row = (blockIdx.y * BLOCK_SIZE + threadIdx.y)*K; // позиция в строке в таблице B самая верхняя
-int twokey = (1<<K);
-int i;
-int least,rest;
+    int x_col = blockIdx.x * BLOCK_SIZE + threadIdx.x; // позиция в колонке этого потока
+    int y_row = (blockIdx.y * BLOCK_SIZE + threadIdx.y)*K; // позиция в строке в таблице B самая верхняя
+    int twokey = (1<<K);
+    int i;
+    int least,rest;
 
 
-if(x_col >= cols || y_row >= rows ) {
+    if(x_col >= cols || y_row >= rows ) {
 // если поток выходит за рамки нашей таблицы по ширине, то ему ничего не надо делать
-return;
-}
+        return;
+    }
 
-uint32_t *T = lookup_tables[blockIdx.y * BLOCK_SIZE + threadIdx.y];  //pointer to table offset for case when too large num tables
+    uint32_t *T = lookup_tables[blockIdx.y * BLOCK_SIZE + threadIdx.y];  //pointer to table offset for case when too large num tables
 
 
-T[x_col] = 0; // row with 000000000...
+    T[x_col] = 0; // row with 000000000...
 
 
 // fill when 1 bit
 #pragma unroll
-for(int j = 0; j < K; j++) {
-i = 1<<(j);
-T[i * cols + x_col] = B[ (y_row + j) * real_cols  + x_col + offset];
-}//kk
+    for(int j = 0; j < K; j++) {
+        i = 1<<(j);
+        T[i * cols + x_col] = B[ (y_row + j) * real_cols  + x_col + offset];
+    }//kk
 
 // fill when 2 and so on...
 #pragma unroll
-for(int h = 2;h <= K; h++) {
+    for(int h = 2;h <= K; h++) {
 //  iterate all integers with h bits, and < 2^k
-i = (1 << h) - 1;
-for (;i < twokey; i = snoob(i)) {
-least = lsb(i);
-rest = i - least;
+        i = (1 << h) - 1;
+        for (;i < twokey; i = snoob(i)) {
+            least = lsb(i);
+            rest = i - least;
 //T[least] and T[rest] already calculated
-T[i * cols + x_col ] = T[ least* cols + x_col] | T[ rest*cols + x_col];
-}
-}
+            T[i * cols + x_col ] = T[ least* cols + x_col] | T[ rest*cols + x_col];
+        }
+    }
 }
 
 
@@ -217,54 +217,54 @@ uint32_t value = 0;
 for(int i = 0; i < full_steps; i++) {
 
 // все полные прогоны по ключам
-    tmp = __brev(A[ row_y * cols + threadIdx.x + i * BLOCK_SIZE_COL]); // reverse
-    local_A[threadIdx.y][threadIdx.x] = tmp;
-    __syncthreads();
+tmp = __brev(A[ row_y * cols + threadIdx.x + i * BLOCK_SIZE_COL]); // reverse
+local_A[threadIdx.y][threadIdx.x] = tmp;
+__syncthreads();
 
 
 
-    for(int t = 0; t < BLOCK_SIZE_COL; t++) {
-        composite_key = local_A[threadIdx.y][t];
-        for(int j = 0; j < 4;j++) {
-            T = lookup_tables[BLOCK_SIZE_COL * i*4 + t*4 + j];
-            actual_key = get_actual_key(composite_key,j);
-            value |= T[actual_key * cols_table + col_in_T];//add if вроде не надо
+for(int t = 0; t < BLOCK_SIZE_COL; t++) {
+composite_key = local_A[threadIdx.y][t];
+for(int j = 0; j < 4;j++) {
+T = lookup_tables[BLOCK_SIZE_COL * i*4 + t*4 + j];
+actual_key = get_actual_key(composite_key,j);
+value |= T[actual_key * cols_table + col_in_T];//add if вроде не надо
 
-        }
-    }
+}
+}
 }
 
 __syncthreads();
 
 if(small_step) {
-    int cur_step = full_steps;
-    if(threadIdx.x + cur_step * BLOCK_SIZE_COL < cols && col_in_T < cols_table && row_y < rows){
-        tmp = __brev(A[ row_y * cols + threadIdx.x + cur_step * BLOCK_SIZE_COL]); // reverse
-        local_A[threadIdx.y][threadIdx.x] = tmp;
-    }
-    __syncthreads();
-    //потоки которые выхлжят им нечего делать, свой вклад в загрузку они уже внесли
-    if(col_x >= cols || col_in_T >= cols_table  || row_y >= rows) {
-        return;
-    }
+int cur_step = full_steps;
+if(threadIdx.x + cur_step * BLOCK_SIZE_COL < cols && col_in_T < cols_table && row_y < rows){
+tmp = __brev(A[ row_y * cols + threadIdx.x + cur_step * BLOCK_SIZE_COL]); // reverse
+local_A[threadIdx.y][threadIdx.x] = tmp;
+}
+__syncthreads();
+//потоки которые выхлжят им нечего делать, свой вклад в загрузку они уже внесли
+if(col_x >= cols || col_in_T >= cols_table  || row_y >= rows) {
+return;
+}
 
-    for(int t = 0; t < last; t++) {
-        composite_key = local_A[threadIdx.y][t];
-        for(int j = 0; j < 4;j++) {
-            T = lookup_tables[cur_step * BLOCK_SIZE_COL * 4 + t*4 + j];
-            actual_key = get_actual_key(composite_key,j);
-            value |= T[actual_key * cols_table + col_in_T];
-        }
-    }
+for(int t = 0; t < last; t++) {
+composite_key = local_A[threadIdx.y][t];
+for(int j = 0; j < 4;j++) {
+T = lookup_tables[cur_step * BLOCK_SIZE_COL * 4 + t*4 + j];
+actual_key = get_actual_key(composite_key,j);
+value |= T[actual_key * cols_table + col_in_T];
+}
+}
 }
 value = value|oldC;
 
 if(is_changed_matrix == NOT_CHANGED && value!=oldC){
-    is_changed_matrix = CHANGED;
+is_changed_matrix = CHANGED;
 }
 
 if(col_x < cols && row_y < rows && col_in_T < cols_table && value != oldC) {
-    C[row_y * cols + col_x] = oldC | value;
+C[row_y * cols + col_x] = oldC | value;
 }
 
 }
@@ -274,15 +274,15 @@ uint32_t * allocate_matrix_device(int rows,int cols){
     uint32_t *matrix;
     cudaMalloc((void **) &matrix, sizeof(uint32_t)*rows*cols);
     return matrix;
-    
-    }
 
-    uint32_t * allocate_matrix_host(int rows,int cols) {
-        // allocate memory in host RAM
-        uint32_t *matrix;
-        cudaMallocHost((void **) &matrix, sizeof(uint32_t)*rows * cols);
-        return matrix;
-        }
+}
+
+uint32_t * allocate_matrix_host(int rows,int cols) {
+    // allocate memory in host RAM
+    uint32_t *matrix;
+    cudaMallocHost((void **) &matrix, sizeof(uint32_t)*rows * cols);
+    return matrix;
+}
 
 
 // a =cb и таков порядок аргубемнов
@@ -301,7 +301,7 @@ cudaMemcpy( b_d,b, sizeof(uint32_t)*rows*cols, cudaMemcpyHostToDevice);
 cudaMemcpy( c_d,c, sizeof(uint32_t)*rows*cols, cudaMemcpyHostToDevice);
 
 
-    // указатель измененности
+// указатель измененности
 uint32_t *is_changed_host = allocate_matrix_host(1,1);
 *is_changed_host = NOT_CHANGED;
 
@@ -310,83 +310,83 @@ cudaMemcpyToSymbol(is_changed_matrix, is_changed_host, sizeof(uint32_t),0,cudaMe
 
 
 
-    // настройка ядер для функции создания таблиц
+// настройка ядер для функции создания таблиц
 dim3 dimBlock_table_kernel(BLOCK_SIZE,BLOCK_SIZE);// для всех вызовов создания таблиц
 
-    //настройка для таблиц из полного цикла
- uint32_t grid_x = table_cols_n/BLOCK_SIZE;
+//настройка для таблиц из полного цикла
+uint32_t grid_x = table_cols_n/BLOCK_SIZE;
 if(table_cols_n%BLOCK_SIZE!=0) grid_x++;
 uint32_t grid_y = rows/(BLOCK_SIZE*K);
 if(rows%(BLOCK_SIZE*K)!=0) grid_y++;
 dim3 dimGrid_table_nums(grid_x,grid_y); //для запуска по батчам создание таблиц
 
-    // настройка для последней таблицы
+// настройка для последней таблицы
 grid_x = table_cols_last/BLOCK_SIZE;
 if(table_cols_last % BLOCK_SIZE!=0) grid_x++;
 dim3 dimGrid_table_last(grid_x,grid_y);
 
-    // настройка ядер для умножения
+// настройка ядер для умножения
 dim3 dimBlock_m4ri(BLOCK_SIZE_COL,BLOCK_SIZE_ROW);
 
-    // настройка для умножения из полного цикла
-    grid_x = table_cols_n /BLOCK_SIZE_COL;
-    if(table_cols_n%BLOCK_SIZE_COL!=0)grid_x++;
-    grid_y = rows/BLOCK_SIZE_ROW;
-    if(rows%BLOCK_SIZE_ROW!=0)grid_y++;
-    dim3 dimGrid_m4ri_nums(grid_x,grid_y);
+// настройка для умножения из полного цикла
+grid_x = table_cols_n /BLOCK_SIZE_COL;
+if(table_cols_n%BLOCK_SIZE_COL!=0)grid_x++;
+grid_y = rows/BLOCK_SIZE_ROW;
+if(rows%BLOCK_SIZE_ROW!=0)grid_y++;
+dim3 dimGrid_m4ri_nums(grid_x,grid_y);
 
-    // настройка для последнего умножения
-    grid_x = table_cols_last/BLOCK_SIZE_COL;
-    if(table_cols_last%BLOCK_SIZE_COL!=0)grid_x++;
-    dim3 dimGrid_m4ri_last(grid_x,grid_y);
+// настройка для последнего умножения
+grid_x = table_cols_last/BLOCK_SIZE_COL;
+if(table_cols_last%BLOCK_SIZE_COL!=0)grid_x++;
+dim3 dimGrid_m4ri_last(grid_x,grid_y);
 
-    //allocate tables
-    uint32_t ** tables_n;// = allocate_tables(num_tables,257*table_cols_n);
-    uint32_t ** tables_last;// = allocate_tables(num_tables,257*table_cols_last);
-    if(num_launches != 0){
-        tables_n = allocate_tables(num_tables,256,table_cols_n);
+//allocate tables
+uint32_t ** tables_n;// = allocate_tables(num_tables,257*table_cols_n);
+uint32_t ** tables_last;// = allocate_tables(num_tables,257*table_cols_last);
+if(num_launches != 0){
+tables_n = allocate_tables(num_tables,256,table_cols_n);
 
-    }
-    if(table_cols_last != 0){
-        tables_last = allocate_tables(num_tables,256,table_cols_last);
-    }
-
-    for(int i = 0;i < num_launches;i++){
-        make_table<<<dimGrid_table_nums,dimBlock_table_kernel>>>
-                                        (b_d,tables_n,table_cols_n,rows,num_tables,cols,i*table_cols_n);
-        cudaDeviceSynchronize();
-        m4ri_mul<<<dimGrid_m4ri_nums,dimBlock_m4ri>>>
-        (c_d,a_d,tables_n,rows,cols,table_cols_n,cols/BLOCK_SIZE_COL,cols%BLOCK_SIZE_COL,i*table_cols_n);
-        cudaDeviceSynchronize();
-    }
-
-    if(table_cols_last != 0){
-
-        make_table<<<dimGrid_table_last,dimBlock_table_kernel>>>
-                                        (b_d,tables_last,table_cols_last,rows,num_tables,cols,num_launches*table_cols_n);
-        cudaDeviceSynchronize();
-        m4ri_mul<<<dimGrid_m4ri_last,dimBlock_m4ri>>>
-        (c_d,a_d,tables_last,rows,cols,table_cols_last,cols/BLOCK_SIZE_COL,cols%BLOCK_SIZE_COL,num_launches*table_cols_n);
-        cudaDeviceSynchronize();
-    }
-
-    if(num_launches!=0){
-        delete_tables(tables_n, num_launches);
-    }
-if(table_cols_last!=0){
-    delete_tables(tables_last,table_cols_last);
+}
+if(table_cols_last != 0){
+tables_last = allocate_tables(num_tables,256,table_cols_last);
 }
 
-    cudaMemcpy( a,a_d, sizeof(uint32_t)*rows*cols, cudaMemcpyDeviceToHost);
-    cudaDeviceSynchronize();
-    cudaMemcpyFromSymbol(is_changed_host,is_changed_matrix, sizeof(uint32_t), 0,cudaMemcpyDeviceToHost);
-    cudaFree(a_d);
-    cudaFree(b_d);
-    cudaFree(c_d);
-    int flag = *is_changed_host;
+for(int i = 0;i < num_launches;i++){
+make_table<<<dimGrid_table_nums,dimBlock_table_kernel>>>
+(b_d,tables_n,table_cols_n,rows,num_tables,cols,i*table_cols_n);
+cudaDeviceSynchronize();
+m4ri_mul<<<dimGrid_m4ri_nums,dimBlock_m4ri>>>
+(c_d,a_d,tables_n,rows,cols,table_cols_n,cols/BLOCK_SIZE_COL,cols%BLOCK_SIZE_COL,i*table_cols_n);
+cudaDeviceSynchronize();
+}
 
-    cudaFreeHost(is_changed_host);
-    return flag;
+if(table_cols_last != 0){
+
+make_table<<<dimGrid_table_last,dimBlock_table_kernel>>>
+(b_d,tables_last,table_cols_last,rows,num_tables,cols,num_launches*table_cols_n);
+cudaDeviceSynchronize();
+m4ri_mul<<<dimGrid_m4ri_last,dimBlock_m4ri>>>
+(c_d,a_d,tables_last,rows,cols,table_cols_last,cols/BLOCK_SIZE_COL,cols%BLOCK_SIZE_COL,num_launches*table_cols_n);
+cudaDeviceSynchronize();
+}
+
+if(num_launches!=0){
+delete_tables(tables_n, num_launches);
+}
+if(table_cols_last!=0){
+delete_tables(tables_last,table_cols_last);
+}
+
+cudaMemcpy( a,a_d, sizeof(uint32_t)*rows*cols, cudaMemcpyDeviceToHost);
+cudaDeviceSynchronize();
+cudaMemcpyFromSymbol(is_changed_host,is_changed_matrix, sizeof(uint32_t), 0,cudaMemcpyDeviceToHost);
+cudaFree(a_d);
+cudaFree(b_d);
+cudaFree(c_d);
+int flag = *is_changed_host;
+
+cudaFreeHost(is_changed_host);
+return flag;
 }
 
 
@@ -646,7 +646,7 @@ public:
 
     }
     void output_in(String filename )  {ifstream input(filename);
-        
+
         vector<String > res(grammar.nonterminalSet.begin(),grammar.nonterminalSet.end());
         sort(res.begin(),res.end());
 
@@ -734,27 +734,27 @@ public:
     }
     int packedByBlocksNumber(int N, int size) {
         return (N / size + (N % size == 0 ? 0 : 1));
-      }
+    }
 
     bool * Decompress(uint32_t * c_arr, uint32_t N) {
         // int num_rows = N;
         int num_columns = packedByBlocksNumber(N, 32);
         bool * arr = reinterpret_cast<bool *>(calloc(N * N, sizeof(bool)));
-      
+
         uint32_t el;
         for (int r = 0; r < N; r++) {
-          for (int c = 0; c < N; c++) {
-            el = c_arr[r * num_columns + (c / 32)];
-            if (el & (1 << (31 - (c % 32)))) {
-              arr[r * N + c] = 1;
+            for (int c = 0; c < N; c++) {
+                el = c_arr[r * num_columns + (c / 32)];
+                if (el & (1 << (31 - (c % 32)))) {
+                    arr[r * N + c] = 1;
+                }
             }
-          }
         }
-      
-        return arr;
-      }
 
-    
+        return arr;
+    }
+
+
 
 private:
 
@@ -805,14 +805,14 @@ private:
 };
 
 
-int main() {
-    auto solution = Solution("Grammar.txt", "Graph.txt", DELIMITR);
+int main(int argc, char* argv[]) {
+    auto solution = Solution(argv[1], argv[2], DELIMITR);
     clock_t begin = clock();
     solution.compute_result();
     clock_t end = clock();
     double elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
-   solution.output_in("RES.TXT");
-   cout<<elapsed_secs<<endl;
+    solution.output_in(argv[3]);
+    cout<<elapsed_secs<<endl;
 
 
 }
