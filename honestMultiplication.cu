@@ -27,369 +27,6 @@ using namespace std;
 using String = std::string;
 
 
-
-#include <assert.h>
-#include <stdio.h>
-#include <stdint.h>
-#define CHANGED 1
-#define NOT_CHANGED 0
-#define lsb(i) ((i) & -(i)) // return least significant bit
-#define BITS sizeof(__uint32_t) * 8// aka 32
-
-
-uint32_t ** allocate_tables(int num_tables,int num_rows,int num_cols){
-
-    uint32_t ** d_ppcPtr, *d_pcPtr;
-    cudaMalloc(&d_ppcPtr, sizeof(uint32_t*) * num_tables);
-
-
-    for(int i = 0; i < num_tables; i ++)
-    {
-        cudaMalloc(&d_pcPtr, sizeof(uint32_t) * num_rows *num_cols );
-        cudaMemset(d_pcPtr, 0, sizeof(uint32_t) * num_rows *num_cols );
-        cudaMemcpy(&d_ppcPtr[i], &d_pcPtr, sizeof(uint32_t*), cudaMemcpyHostToDevice);
-    }
-    return d_ppcPtr;
-}
-
-void delete_tables(uint32_t**tables,int num_tables){
-    uint32_t *d_pcPtr;
-    for(int i = 0; i < num_tables; i ++)
-    {
-        //cudaMemcpy(&d_pcPtr,&tables[i], sizeof(uint32_t*), cudaMemcpyHostToDevice);
-        cudaMemcpy(&d_pcPtr,&tables[i], sizeof(uint32_t*), cudaMemcpyDeviceToHost);
-        cudaFree(d_pcPtr);
-    }
-    cudaFree(tables);
-}
-
-
-
-
-//return the next number with the same number of bits
-__device__ int snoob(int i)
-{
-    int least = lsb(i);
-    int ripple = i + least;
-    return (((ripple ^ i) >> 2) / least) | ripple;
-}
-
-
-#define K 8
-#define BLOCK_SIZE 32
-/*
-*  For C=AXB  make part of  table
-*  lookup_tables part table
-*  cols - cols for current  cols size of part of table
-*  rows - rows in A,B,C
-*  tables_num  in nums of tables
-*  real_cols cols in A,B,C
-*  offset - for what part of table
-*/
-__global__ void make_table(uint32_t *B, uint32_t ** lookup_tables, int cols, int rows, int tables_num, int real_cols, int offset) {
-
-//каждый элемент считает часть таблицу (256 элементов)   8 элементов в матр-це б
-    int x_col = blockIdx.x * BLOCK_SIZE + threadIdx.x; // позиция в колонке этого потока
-    int y_row = (blockIdx.y * BLOCK_SIZE + threadIdx.y)*K; // позиция в строке в таблице B самая верхняя
-    int twokey = (1<<K);
-    int i;
-    int least,rest;
-
-
-    if(x_col >= cols || y_row >= rows ) {
-// если поток выходит за рамки нашей таблицы по ширине, то ему ничего не надо делать
-        return;
-    }
-
-    uint32_t *T = lookup_tables[blockIdx.y * BLOCK_SIZE + threadIdx.y];  //pointer to table offset for case when too large num tables
-
-
-    T[x_col] = 0; // row with 000000000...
-
-
-// fill when 1 bit
-#pragma unroll
-    for(int j = 0; j < K; j++) {
-        i = 1<<(j);
-        T[i * cols + x_col] = B[ (y_row + j) * real_cols  + x_col + offset];
-    }//kk
-
-// fill when 2 and so on...
-#pragma unroll
-    for(int h = 2;h <= K; h++) {
-//  iterate all integers with h bits, and < 2^k
-        i = (1 << h) - 1;
-        for (;i < twokey; i = snoob(i)) {
-            least = lsb(i);
-            rest = i - least;
-//T[least] and T[rest] already calculated
-            T[i * cols + x_col ] = T[ least* cols + x_col] | T[ rest*cols + x_col];
-        }
-    }
-}
-
-
-#define BLOCK_SIZE_COL 32
-#define BLOCK_SIZE_ROW 32
-
-__device__ int get_actual_key(uint32_t composite_key,int j){
-    return  (0xFF) & (composite_key >> (8 * j));
-}
-
-
-
-__device__ uint32_t is_changed_matrix = 0;
-
-
-/*
-* ВАЖНО: Если C  и A одна и  та же матрица, необходимо заменить одну из них копией, а потом поинетр перекинуть
-*  For C=AXB  perform multiplication over subring F2
-*  lookup_tables part table
-*  rows - rows in A,B,C
-*  cols - cols in A,B,C
-*  full_steps  nums of steps
-*  small_steps small_steps
-*  offset - for what part of C we calculate
-*  is_changed - flag that determine wheather matrix changed during multiplication
-*
-*  настройка ядер для умножения
-*  dim3 dimBlock_m4ri(BLOCK_SIZE_COL,BLOCK_SIZE_ROW);
-*
-*  настройка для умножения из полного цикла
-*  grid_x = table_cols_n /BLOCK_SIZE_COL;
-*  if(table_cols_n%BLOCK_SIZE_COL!=0)grid_x++;
-*  grid_y = rows/BLOCK_SIZE_ROW;
-*  if(rows%BLOCK_SIZE_ROW!=0)grid_y++;
-*  dim3 dimGrid_m4ri_nums(grid_x,grid_y);
-*
-*  настройка для последнего умножения
-*  grid_x = table_cols_last/BLOCK_SIZE_COL;
-*  if(table_cols_last%BLOCK_SIZE_COL!=0)grid_x++;
-*  dim3 dimGrid_m4ri_last(grid_x,grid_y);
-*
-*  Пример
-*    // full_step = table_cols_n/BLOCK_SIZE_COL;
-*    // small_step = table_cols_n%BLOCK_SIZE_COL;
-*    // offset = i*table_cols_n
-*    for(int i = 0;i < num_launches;i++){
-*        make_table<<<dimGrid_table_nums,dimBlock_table_kernel>>>(B,tables_n,table_cols_n,rows,num_tables,cols,i*table_cols_n);
-*        cudaDeviceSynchronize();
-*        m4ri_mul<<<dimGrid_m4ri_nums,dimBlock_m4ri>>>(A,C,tables_n,rows,cols,table_cols_n,table_cols_n/BLOCK_SIZE_COL,table_cols_n%BLOCK_SIZE_COL,i*table_cols_n,is_changed_device);
-*        cudaDeviceSynchronize();
-*    }
-*    // full_step = table_cols_last/BLOCK_SIZE_COL;
-*    // small_step = table_cols_last%BLOCK_SIZE_COL;
-*    // offset = num_launches*table_cols_n
-*    if(table_cols_last != 0){
-*
-*        make_table<<<dimGrid_table_last,dimBlock_table_kernel>>>(B,tables_last,table_cols_last,rows,num_tables,cols,num_launches*table_cols_n);
-*        cudaDeviceSynchronize();
-*        m4ri_mul<<<dimGrid_m4ri_last,dimBlock_m4ri>>>(A,C,tables_last,rows,cols,table_cols_last,table_cols_last/BLOCK_SIZE_COL,table_cols_last%BLOCK_SIZE_COL,num_launches*table_cols_n,is_changed_device);
-*        cudaDeviceSynchronize();
-*    }
-*
-*/
-__global__ void m4ri_mul(uint32_t *A, uint32_t *C, uint32_t **lookup_tables,int rows, int cols,int cols_table,int full_steps,int small_step,int offset) {
-// каждый поток заполняет 1 элемент в в матрице С
-__shared__ uint32_t local_A[BLOCK_SIZE_ROW][BLOCK_SIZE_COL];
-int col_x = threadIdx.x + blockIdx.x * BLOCK_SIZE_COL + offset; // where in  C
-int row_y = threadIdx.y + blockIdx.y * BLOCK_SIZE_ROW; // where in C
-int last = cols_table % BLOCK_SIZE_COL;// определяет сколько при неполном надо ключей набирать
-
-int col_in_T = threadIdx.x + blockIdx.x * BLOCK_SIZE_COL;// по совместительству сколько эл-ов максимльно мы сейчас можем обработать
-
-uint32_t *T;
-uint32_t composite_key;
-int actual_key;
-uint32_t oldC;
-
-if(col_x < cols && col_in_T < cols_table && row_y < rows) {
-oldC = C[row_y * cols + col_x];
-} else {
-oldC = 0;
-}
-
-
-
-uint32_t tmp;
-uint32_t value = 0;
-#pragma unroll
-for(int i = 0; i < full_steps; i++) {
-
-// все полные прогоны по ключам
-tmp = __brev(A[ row_y * cols + threadIdx.x + i * BLOCK_SIZE_COL]); // reverse
-local_A[threadIdx.y][threadIdx.x] = tmp;
-__syncthreads();
-
-
-
-for(int t = 0; t < BLOCK_SIZE_COL; t++) {
-composite_key = local_A[threadIdx.y][t];
-for(int j = 0; j < 4;j++) {
-T = lookup_tables[BLOCK_SIZE_COL * i*4 + t*4 + j];
-actual_key = get_actual_key(composite_key,j);
-value |= T[actual_key * cols_table + col_in_T];//add if вроде не надо
-
-}
-}
-}
-
-__syncthreads();
-
-if(small_step) {
-int cur_step = full_steps;
-if(threadIdx.x + cur_step * BLOCK_SIZE_COL < cols && col_in_T < cols_table && row_y < rows){
-tmp = __brev(A[ row_y * cols + threadIdx.x + cur_step * BLOCK_SIZE_COL]); // reverse
-local_A[threadIdx.y][threadIdx.x] = tmp;
-}
-__syncthreads();
-//потоки которые выхлжят им нечего делать, свой вклад в загрузку они уже внесли
-if(col_x >= cols || col_in_T >= cols_table  || row_y >= rows) {
-return;
-}
-
-for(int t = 0; t < last; t++) {
-composite_key = local_A[threadIdx.y][t];
-for(int j = 0; j < 4;j++) {
-T = lookup_tables[cur_step * BLOCK_SIZE_COL * 4 + t*4 + j];
-actual_key = get_actual_key(composite_key,j);
-value |= T[actual_key * cols_table + col_in_T];
-}
-}
-}
-value = value|oldC;
-
-if(is_changed_matrix == NOT_CHANGED && value!=oldC){
-is_changed_matrix = CHANGED;
-}
-
-if(col_x < cols && row_y < rows && col_in_T < cols_table && value != oldC) {
-C[row_y * cols + col_x] = oldC | value;
-}
-
-}
-
-
-uint32_t * allocate_matrix_device(int rows,int cols){
-    uint32_t *matrix;
-    cudaMalloc((void **) &matrix, sizeof(uint32_t)*rows*cols);
-    return matrix;
-
-}
-
-uint32_t * allocate_matrix_host(int rows,int cols) {
-    // allocate memory in host RAM
-    uint32_t *matrix;
-    cudaMallocHost((void **) &matrix, sizeof(uint32_t)*rows * cols);
-    return matrix;
-}
-
-
-// a =cb и таков порядок аргубемнов
-int wrapper_m4ri(uint32_t *a,uint32_t *c,uint32_t *b,int rows,int cols){
-int table_cols_max = 32;
-int num_tables = rows/K;
-int num_launches = cols/table_cols_max;
-int table_cols_n = table_cols_max;
-int table_cols_last =  cols % table_cols_max;
-uint32_t * a_d  = allocate_matrix_device(rows,cols);
-uint32_t * b_d  = allocate_matrix_device(rows,cols);
-uint32_t * c_d  = allocate_matrix_device(rows,cols);
-
-cudaMemcpy( a_d,a, sizeof(uint32_t)*rows*cols, cudaMemcpyHostToDevice);
-cudaMemcpy( b_d,b, sizeof(uint32_t)*rows*cols, cudaMemcpyHostToDevice);
-cudaMemcpy( c_d,c, sizeof(uint32_t)*rows*cols, cudaMemcpyHostToDevice);
-
-
-// указатель измененности
-uint32_t *is_changed_host = allocate_matrix_host(1,1);
-*is_changed_host = NOT_CHANGED;
-
-cudaMemcpyToSymbol(is_changed_matrix, is_changed_host, sizeof(uint32_t),0,cudaMemcpyHostToDevice);
-
-
-
-
-// настройка ядер для функции создания таблиц
-dim3 dimBlock_table_kernel(BLOCK_SIZE,BLOCK_SIZE);// для всех вызовов создания таблиц
-
-//настройка для таблиц из полного цикла
-uint32_t grid_x = table_cols_n/BLOCK_SIZE;
-if(table_cols_n%BLOCK_SIZE!=0) grid_x++;
-uint32_t grid_y = rows/(BLOCK_SIZE*K);
-if(rows%(BLOCK_SIZE*K)!=0) grid_y++;
-dim3 dimGrid_table_nums(grid_x,grid_y); //для запуска по батчам создание таблиц
-
-// настройка для последней таблицы
-grid_x = table_cols_last/BLOCK_SIZE;
-if(table_cols_last % BLOCK_SIZE!=0) grid_x++;
-dim3 dimGrid_table_last(grid_x,grid_y);
-
-// настройка ядер для умножения
-dim3 dimBlock_m4ri(BLOCK_SIZE_COL,BLOCK_SIZE_ROW);
-
-// настройка для умножения из полного цикла
-grid_x = table_cols_n /BLOCK_SIZE_COL;
-if(table_cols_n%BLOCK_SIZE_COL!=0)grid_x++;
-grid_y = rows/BLOCK_SIZE_ROW;
-if(rows%BLOCK_SIZE_ROW!=0)grid_y++;
-dim3 dimGrid_m4ri_nums(grid_x,grid_y);
-
-// настройка для последнего умножения
-grid_x = table_cols_last/BLOCK_SIZE_COL;
-if(table_cols_last%BLOCK_SIZE_COL!=0)grid_x++;
-dim3 dimGrid_m4ri_last(grid_x,grid_y);
-
-//allocate tables
-uint32_t ** tables_n;// = allocate_tables(num_tables,257*table_cols_n);
-uint32_t ** tables_last;// = allocate_tables(num_tables,257*table_cols_last);
-if(num_launches != 0){
-tables_n = allocate_tables(num_tables,256,table_cols_n);
-
-}
-if(table_cols_last != 0){
-tables_last = allocate_tables(num_tables,256,table_cols_last);
-}
-
-for(int i = 0;i < num_launches;i++){
-make_table<<<dimGrid_table_nums,dimBlock_table_kernel>>>
-(b_d,tables_n,table_cols_n,rows,num_tables,cols,i*table_cols_n);
-cudaDeviceSynchronize();
-m4ri_mul<<<dimGrid_m4ri_nums,dimBlock_m4ri>>>
-(c_d,a_d,tables_n,rows,cols,table_cols_n,cols/BLOCK_SIZE_COL,cols%BLOCK_SIZE_COL,i*table_cols_n);
-cudaDeviceSynchronize();
-}
-
-if(table_cols_last != 0){
-
-make_table<<<dimGrid_table_last,dimBlock_table_kernel>>>
-(b_d,tables_last,table_cols_last,rows,num_tables,cols,num_launches*table_cols_n);
-cudaDeviceSynchronize();
-m4ri_mul<<<dimGrid_m4ri_last,dimBlock_m4ri>>>
-(c_d,a_d,tables_last,rows,cols,table_cols_last,cols/BLOCK_SIZE_COL,cols%BLOCK_SIZE_COL,num_launches*table_cols_n);
-cudaDeviceSynchronize();
-}
-
-if(num_launches!=0){
-delete_tables(tables_n, num_launches);
-}
-if(table_cols_last!=0){
-delete_tables(tables_last,table_cols_last);
-}
-
-cudaMemcpy( a,a_d, sizeof(uint32_t)*rows*cols, cudaMemcpyDeviceToHost);
-cudaDeviceSynchronize();
-cudaMemcpyFromSymbol(is_changed_host,is_changed_matrix, sizeof(uint32_t), 0,cudaMemcpyDeviceToHost);
-cudaFree(a_d);
-cudaFree(b_d);
-cudaFree(c_d);
-int flag = *is_changed_host;
-
-cudaFreeHost(is_changed_host);
-return flag;
-}
-
-
 class Grammar {
 public:
     std::set<String> nonterminalSet;
@@ -602,6 +239,19 @@ public:
 
 
 
+uint32_t * allocate_matrix_host(int rows,int cols) {
+    // allocate memory in host RAM
+    uint32_t *matrix;
+    cudaMallocHost((void **) &matrix, sizeof(uint32_t)*rows * cols);
+    return matrix;
+}
+
+uint32_t * allocate_matrix_device(int rows,int cols){
+    uint32_t *matrix;
+    cudaMalloc((void **) &matrix, sizeof(uint32_t)*rows*cols);
+    return matrix;
+
+}
 
 
 void delete_matrix_device(uint32_t * matrix) {
@@ -613,6 +263,41 @@ void delete_matrix_host(uint32_t * matrix) {
 }
 
 
+
+//__device__ is_changed = 0;
+__global__ void gpu_matrix_mult(uint32_t *a,uint32_t *b, uint32_t *c, int m, int n, int k,uint32_t * is_changed)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t sum = 0;
+    uint32_t old_c;
+
+    if( col < k && row < m)
+    {
+        old_c = c[row*k+col];
+        sum = 0;
+        for(int i = 0; i < n; i++)
+        {
+            sum |= a[row * n + i] & b[i * k + col];
+        }
+        sum|=old_c;
+        if(*is_changed == NOT_CHANGED && sum!=old_c ) {
+
+            *is_changed = IS_CHANGED;
+        }
+        c[row * k + col] = sum;
+    }
+
+//    uint32_t value = 0;
+    //
+    //                for (int k = 0; k < row_b; k++) {
+    //                    value |= a[i * row_b + k] & b[k * col_b + j];
+    //                }
+    //                if (*is_changed == NOT_CHANGED && (c[i * col_b + j] | value) != c[i * col_b + j]) {
+    //                    *is_changed = IS_CHANGED;
+    //                }
+    //                c[i * col_b + j] |=
+}
 
 struct Matrix {
     uint32_t *matrix_host;
@@ -635,6 +320,7 @@ public:
     Graph graph;
     Grammar grammar;
     map<String, Matrix> nonTerminalToMatrix;
+    uint32_t * extra_matrix;
     Table table;
 
     Solution(const String &filename_grammar, const String &filename_graph, const String &delimiter = " ") {
@@ -645,29 +331,7 @@ public:
         construct_and_fill_matrices_for_nonterminal_test();
 
     }
-    void output_in(String filename )  {ifstream input(filename);
 
-        vector<String > res(grammar.nonterminalSet.begin(),grammar.nonterminalSet.end());
-        sort(res.begin(),res.end());
-
-        ofstream outputfile;
-        outputfile.open(filename);
-        for (auto &nonterminal: res) {
-            auto & matrix = nonTerminalToMatrix.at(nonterminal);
-            outputfile << nonterminal;
-            bool *bitArray = Decompress(matrix.matrix_host, graph.max_number_of_vertex);
-            for (int i = 0; i < graph.max_number_of_vertex; ++i) {
-                for (int j = 0; j < graph.max_number_of_vertex; ++j) {
-                    if (bitArray[i * graph.max_number_of_vertex + j] != 0) {
-                        outputfile << ' ' << i << ' ' << j;
-                    }
-                }
-            }
-            outputfile << endl;
-        }
-        outputfile.close();
-
-    }
     void compute_result() {
         // initial setup
         set<String> changed_matrices = set<String>();
@@ -732,48 +396,58 @@ public:
 
 
     }
-    int packedByBlocksNumber(int N, int size) {
-        return (N / size + (N % size == 0 ? 0 : 1));
-    }
-
-    bool * Decompress(uint32_t * c_arr, uint32_t N) {
-        // int num_rows = N;
-        int num_columns = packedByBlocksNumber(N, 32);
-        bool * arr = reinterpret_cast<bool *>(calloc(N * N, sizeof(bool)));
-
-        uint32_t el;
-        for (int r = 0; r < N; r++) {
-            for (int c = 0; c < N; c++) {
-                el = c_arr[r * num_columns + (c / 32)];
-                if (el & (1 << (31 - (c % 32)))) {
-                    arr[r * N + c] = 1;
-                }
-            }
-        }
-
-        return arr;
-    }
-
-
 
 private:
 
+
+    // не забудь здесь выставить флаги для тех матриц, в которых не нули
+    // void construct_and_fill_matrices_for_nonterminals() {
+    //     int rows = this->graph.multiple_by_32;
+    //     int cols = this->graph.multiple_by_32 / SQUEEZE;  // сжимаем по строкам
+    //     for (auto nonterminal: grammar.nonterminalSet) {
+    //         Matrix matrix = Matrix();
+    //         matrix.matrix_host = alloc_matrix_host_with_zeros(rows, cols);
+    //         matrix.is_changed_host = alloc_matrix_host_with_zeros(1, 1);
+    //         this->nonTerminalToMatrix.insert(make_pair(nonterminal, matrix));
+    //         matrix.matrix_device = alloc_matrix_device_with_zeros(rows, cols);// на гпу
+    //     }// заполнили нулями для хоста
+
+    //     for (auto &edge:graph.edges) {
+    //         auto i = edge.from;
+    //         auto j = edge.to;
+    //         for (const auto &nonterminal:edge.label) { // заполнилии 1 в i,j для матриц на метках из i в j есть этот нетерминал
+    //             fill_squeezed_matrix(this->nonTerminalToMatrix.find(nonterminal)->second.matrix_host, i, j,
+    //                                  graph.multiple_by_32);
+    //         }
+    //     }
+
+    //     for (const auto &nonterminal: grammar.nonterminalSet) {//трансфер данные с цпу на гпу
+    //         auto &matrix = this->nonTerminalToMatrix.find(nonterminal)->second;
+    //         transfer_matrix_from_host_to_gpu(matrix.matrix_host, matrix.matrix_device, rows, cols);
+    //     }
+    // }
+
     void construct_and_fill_matrices_for_nonterminal_test() {
-        int rows = this->graph.multiple_by_32;
-        int cols = this->graph.multiple_by_32/32;
+        int rows = this->graph.max_number_of_vertex;
+        int cols = this->graph.max_number_of_vertex;
+        int squeezed_cols = this->graph.multiple_by_32;
         for (auto nonterminal: grammar.nonterminalSet) {
             Matrix matrix = Matrix();
             matrix.matrix_host = allocate_matrix_host(rows,cols); //alloc_matrix_host_with_zeros(rows, cols);
+            // matrix.matrix_squeezed_host = new uint32_t[rows*squeezed_cols];
             matrix.is_changed_host = allocate_matrix_host(1,1);
             *matrix.is_changed_host = NOT_CHANGED;
+
             this->nonTerminalToMatrix.insert(make_pair(nonterminal, matrix));
         }// заполнили нулями для хоста
+        extra_matrix = allocate_matrix_host(cols,rows); // аллок памяти для доп матрицы
         for (auto &edge:graph.edges) {
             auto i = edge.from;
             auto j = edge.to;
             for (const auto &nonterminal:edge.label) { // заполнилии 1 в i,j для матриц на метках из i в j есть этот нетерминал
                 auto &matrix = this->nonTerminalToMatrix.find(nonterminal)->second;
-                write_bit(matrix.matrix_host,i,j,cols);
+                matrix.matrix_host[i * cols + j] = 1;
+                //write_bit(matrix.matrix_squeezed_host,i,j,squeezed_cols);
                 if (*matrix.is_changed_host == NOT_CHANGED) {
                     *matrix.is_changed_host = IS_CHANGED;
                 }
@@ -783,23 +457,123 @@ private:
 
 
     void write_bit(uint32_t *m, int i, int j,int cols){
+//        m[i * cols + (j / 32)] |= (1ULL << (31 - (j % 32)));
         m[i * cols + (j / 32)] |= (1 << (31 - (j % 32)));
     }
 
+    inline void fill_squeezed_matrix(uint32_t *matrix, int i, int j, int size32) {
+        // строка ок
+        int cols = size32 / 32;
+        int position_in_number32 = (SQUEEZE - 1) - (j % SQUEEZE);
+        int position_in_squezzed_row = j / 32;
+        matrix[i * cols + position_in_squezzed_row] |= (1L << position_in_number32);
+    }
 
+    // uint32_t *alloc_matrix_host_with_zeros(int rows, int cols) {
+    // }
+
+    // uint32_t *alloc_matrix_device_with_zeros(int rows, int cols) {
+    // }
+
+    void transfer_matrix_from_host_to_gpu(uint32_t *host, uint32_t *device, int rows, int cols) {
+        //
+    }
+
+    void transfer_matrix_from_gpu_to_host(uint32_t *device, uint32_t *host, int rows, int cols) {
+
+    }
+
+
+    void gpu_version(const uint32_t *a, const uint32_t *b, uint32_t *c, int n, uint32_t *is_changed){
+
+        // c += ab
+        //  cout<<"H";
+
+        uint32_t * a_d  = allocate_matrix_device(n,n);
+        uint32_t * b_d  = allocate_matrix_device(n,n);
+        uint32_t * c_d  = allocate_matrix_device(n,n);
+        uint32_t * flag_device = allocate_matrix_device(1,1);
+
+        cudaMemcpy( a_d,a, sizeof(uint32_t)*n*n, cudaMemcpyHostToDevice);
+        cudaMemcpy( b_d,b, sizeof(uint32_t)*n*n, cudaMemcpyHostToDevice);
+        cudaMemcpy( c_d,c, sizeof(uint32_t)*n*n, cudaMemcpyHostToDevice);
+        cudaMemcpy( flag_device,is_changed, sizeof(uint32_t), cudaMemcpyHostToDevice);
+        cudaDeviceSynchronize();
+
+
+        dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE);
+        dim3 dimGrid((n + BLOCK_SIZE - 1) / BLOCK_SIZE, (n + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        gpu_matrix_mult<<<dimGrid,dimBlock>>>(a_d,b_d, c_d, n,  n, n,flag_device);
+        cudaDeviceSynchronize();
+
+
+        cudaMemcpy( c,c_d, sizeof(uint32_t)*n*n, cudaMemcpyDeviceToHost);
+        cudaMemcpy( is_changed,flag_device, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+
+        cudaDeviceSynchronize();
+
+        delete_matrix_device(a_d);
+        delete_matrix_device(b_d);
+        delete_matrix_device(c_d);
+        delete_matrix_device(flag_device);
+
+    }
+
+    // c = ab
+    void dummy_subring_matrix_mul(const uint32_t *a, int row_a, int col_a, const uint32_t *b, int row_b, int col_b,
+                                  uint32_t *c, uint32_t *is_changed) {
+        if (col_a != row_b) {
+            printf("The matrices can't be multiplied with each other.\n");
+            return;
+        }
+        gpu_version(a,b,c,row_a,is_changed);
+//
+//        for (int i = 0; i < row_a; i++) {
+//
+//            for (int j = 0; j < col_b; j++) {
+//                uint32_t value = 0;
+//
+//                for (int k = 0; k < row_b; k++) {
+//                    value |= a[i * row_b + k] & b[k * col_b + j];
+//                }
+//                if (*is_changed == NOT_CHANGED && (c[i * col_b + j] | value) != c[i * col_b + j]) {
+//                    *is_changed = IS_CHANGED;
+//                }
+//                c[i * col_b + j] |= value;
+//            }
+//        }
+    }
+    // perform algo
+
+    //
+    // allocate matrices and tables on device
+
+    //
 
     // A = C*B
     int perform_matrix_mul(const String &head, const String &left, const String &right) {
-        int rows = graph.multiple_by_32;
-        int cols = graph.multiple_by_32/32;
+        int rows = graph.max_number_of_vertex;
+        int cols = graph.max_number_of_vertex;
         auto &A = this->nonTerminalToMatrix.at(head);
         auto &C = this->nonTerminalToMatrix.at(left);
         auto &B = this->nonTerminalToMatrix.at(right);
         *A.is_changed_host = 0;
-        // a =cb и таков порядок аргубемнов
-        int res = wrapper_m4ri(A.matrix_host,C.matrix_host,B.matrix_host,rows,cols);
-        *A.is_changed_host =  res;
-        return res;
+        if (head == left) {// нужно создать доп матрицу т.к A = C
+            copy(C.matrix_host, C.matrix_host + rows * cols, extra_matrix);
+            dummy_subring_matrix_mul(extra_matrix, rows, cols, B.matrix_host, rows, cols, A.matrix_host,
+                                     A.is_changed_host);
+        }
+        if (head == right) {//нужно создать доп матрицу т.к A = B
+            copy(B.matrix_host, B.matrix_host + rows * cols, extra_matrix);
+            dummy_subring_matrix_mul(C.matrix_host, rows, cols, extra_matrix, rows, cols, A.matrix_host,
+                                     A.is_changed_host);
+        } else {
+            dummy_subring_matrix_mul(C.matrix_host, rows, cols, B.matrix_host, rows, cols, A.matrix_host,
+                                     A.is_changed_host);
+
+
+        }
+        return *A.is_changed_host;
     }
 
 };
@@ -811,7 +585,31 @@ int main(int argc, char* argv[]) {
     solution.compute_result();
     clock_t end = clock();
     double elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
-    solution.output_in(argv[3]);
+
+    ifstream input(argv[3]);
+
+    vector<String > res(solution.grammar.nonterminalSet.begin(),solution.grammar.nonterminalSet.end());
+    sort(res.begin(),res.end());
+
+    ofstream outputfile;
+    outputfile.open(argv[3]);
+
+    for (auto &nonterminal: res) {
+        auto &matrix = solution.nonTerminalToMatrix.at(nonterminal);
+
+        outputfile << nonterminal;
+        for (int i = 0; i < solution.graph.max_number_of_vertex; i++) {
+            for (int j = 0; j < solution.graph.max_number_of_vertex; j++) {
+                if (matrix.matrix_host[i * solution.graph.max_number_of_vertex + j] != 0) {
+                    outputfile << " " << i << " " << j;
+                }
+            }
+        }
+        outputfile << endl;
+    }
+    outputfile.close();
+
+
     cout<<elapsed_secs<<endl;
 
 
