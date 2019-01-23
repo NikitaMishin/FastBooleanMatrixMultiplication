@@ -194,7 +194,7 @@ __global__ void m4ri_mul(uint32_t *A, uint32_t *C, uint32_t **lookup_tables,int 
 __shared__ uint32_t local_A[BLOCK_SIZE_ROW][BLOCK_SIZE_COL];
 int col_x = threadIdx.x + blockIdx.x * BLOCK_SIZE_COL + offset; // where in  C
 int row_y = threadIdx.y + blockIdx.y * BLOCK_SIZE_ROW; // where in C
-int last = cols_table % BLOCK_SIZE_COL;// определяет сколько при неполном надо ключей набирать
+int last = cols % BLOCK_SIZE_COL;// определяет сколько при неполном надо ключей набирать
 
 int col_in_T = threadIdx.x + blockIdx.x * BLOCK_SIZE_COL;// по совместительству сколько эл-ов максимльно мы сейчас можем обработать
 
@@ -238,7 +238,7 @@ __syncthreads();
 
 if(small_step) {
 int cur_step = full_steps;
-if(threadIdx.x + cur_step * BLOCK_SIZE_COL < cols && col_in_T < cols_table && row_y < rows){
+if(threadIdx.x + cur_step * BLOCK_SIZE_COL < cols  && row_y < rows){
 tmp = __brev(A[ row_y * cols + threadIdx.x + cur_step * BLOCK_SIZE_COL]); // reverse
 local_A[threadIdx.y][threadIdx.x] = tmp;
 }
